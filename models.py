@@ -82,3 +82,12 @@ class ScoreAnomaly(Base):
     panel_average = Column(Float)
     deviation = Column(Float)
     resolved = Column(Integer, default=0) # 0 = Pending, 1 = Resolved
+
+class ActivityLog(Base):
+    __tablename__ = "activity_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(Integer, ForeignKey("events.id"))
+    action = Column(String, index=True) # e.g., "STAGE_ADVANCED", "TOKEN_GENERATED"
+    actor = Column(String) # e.g., "System", "Committee", "Participant_12"
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    metadata_info = Column(JSON)

@@ -1,15 +1,27 @@
-from fastapi import FastAPI, Depends
-from sqlalchemy.orm import Session
-import models
-from database import engine, get_db
-from typing import List
-from fastapi import HTTPException
-import schemas
-import services
+import os
 import csv
 import io
+from datetime import datetime, timedelta
+from typing import List
+
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Body
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
+import jwt
+
+import models
+import schemas
+import services
+from database import engine, get_db
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+SECRET_KEY = os.getenv("SECRET_KEY", "super_secret_hackathon_key_do_not_share")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
 
 # Create the database tables
 models.Base.metadata.create_all(bind=engine)
@@ -23,6 +35,17 @@ app = FastAPI(
 @app.get("/")
 def health_check():
     return {"status": "System Online", "message": "EventFlow Core is running."}
+
+def log_activity(db: Session, event_id: int, action: str, actor: str, meta: dict = None):
+    """Global utility to record significant system events."""
+    log = models.ActivityLog(
+        event_id=event_id,
+        action=action,
+        actor=actor,
+        metadata_info=meta or {}
+    )
+    db.add(log)
+    db.commit()
 
 def verify_team_approval_gate(team_id: int, db: Session = Depends(get_db)):
     """
@@ -431,3 +454,79 @@ def advance_event_stage(event_id: int, payload: StageUpdateRequest, db: Session 
     db.commit()
 
     return {"status": "success", "current_stage": event.state}
+
+@app.post("/participants/{participant_id}/generate-token")
+def generate_participant_token(participant_id: int, db: Session = Depends(get_db)):
+    """
+    Generates a secure, 7-day signed JWT token for passwordless portal access.
+    """
+    participant = db.query(models.Participant).filter(models.Participant.id == participant_id).first()
+    if not participant:
+        raise HTTPException(status_code=404, detail="Participant not found")
+    
+    # 1. Create the secure payload
+    expire = datetime.utcnow() + timedelta(days=7)
+    to_encode = {
+        "sub": str(participant.id), 
+        "role": "participant", 
+        "event_id": participant.event_id,
+        "exp": expire
+    }
+    
+    # 2. Sign the token
+    token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    
+    # 3. Log the generation
+    log_activity(db, participant.event_id, "TOKEN_GENERATED", "System", {"participant_id": participant.id})
+    
+    return {
+        "status": "success",
+        "participant_name": participant.name,
+        "access_token": token, 
+        "magic_link": f"/participants/portal/{token}"
+    }
+
+@app.get("/participants/portal/{token}")
+def participant_portal_status(token: str, db: Session = Depends(get_db)):
+    """
+    The secure portal. Decodes the JWT and returns real-time event status.
+    """
+    # 1. Verify and decode the JWT
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        participant_id = int(payload.get("sub"))
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired. Request a new link.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid authentication token.")
+
+    # 2. Fetch User & Event Context
+    participant = db.query(models.Participant).filter(models.Participant.id == participant_id).first()
+    if not participant:
+        raise HTTPException(status_code=404, detail="Participant not found")
+        
+    event = db.query(models.Event).filter(models.Event.id == participant.event_id).first()
+    
+    # 3. Fetch Team Assignment (BUT ONLY IF APPROVED)
+    team_info = "Assignment Pending"
+    if participant.team_id:
+        team = db.query(models.Team).filter(models.Team.id == participant.team_id).first()
+        if team and team.is_approved == 1: # Strict visibility check
+            team_members = [m.name for m in team.members if m.id != participant.id]
+            team_info = {
+                "team_name": team.name, 
+                "teammates": team_members
+            }
+    
+    # 4. Log the login
+    log_activity(db, event.id, "PORTAL_ACCESSED", f"Participant_{participant.id}", {})
+
+    return {
+        "authenticated": True,
+        "welcome": participant.name,
+        "event_status": {
+            "name": event.name,
+            "current_stage": event.state.value if hasattr(event.state, 'value') else event.state
+        },
+        "your_team": team_info
+    }
